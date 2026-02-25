@@ -1,0 +1,56 @@
+services:
+
+  pgvector:
+    image: ankane/pgvector:latest
+    container_name: rag_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ragdb
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: rag_ollama_init
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+      sleep 8 &&
+      ollama pull llama3 && ollama pull nomic-embed-text
+      "
+    volumes:
+      - ollama_data:/root/.ollama
+
+  app:
+    build: .
+    container_name: rag_app
+    depends_on:
+      - pgvector
+      - ollama-init
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@pgvector:5432/ragdb
+      OLLAMA_BASE_URL: http://ollama:11434
+    tty: true
+    stdin_open: true
+    volumes:
+      - .:/app
+
+volumes:
+  pgvector_data:
+  ollama_data:
