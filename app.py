@@ -1,24 +1,58 @@
 import os
 import sys
-
+import pdfplumber
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_community.vectorstores import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 
-# Trocamos o loader por este aqui!
-from langchain_community.document_loaders import PDFPlumberLoader
-        
 # ============================================================
 # CONFIGURAÇÕES
 # ============================================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
-COLLECTION_NAME = "meu_pdf"
+COLLECTION_NAME = "edital_ifsuldeminas_v2" # Mudamos o nome para recriar com a nova lógica
 PDF_PATH = "documento.pdf"
+
+# ============================================================
+# FUNÇÃO DE EXTRAÇÃO MELHORADA (PDF -> TEXTO + MARKDOWN)
+# ============================================================
+def carregar_pdf_com_tabelas(pdf_path):
+    print(f"📂 Abrindo PDF: {pdf_path} com PDFPlumber...")
+    documents = []
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            # 1. Extrai o texto normal
+            text = page.extract_text() or ""
+            
+            # 2. Extrai as tabelas de forma estruturada
+            tables = page.extract_tables()
+            table_markdown = ""
+            
+            if tables:
+                for table in tables:
+                    for row in table:
+                        # Limpa quebras de linha dentro das células para não quebrar o Markdown
+                        cells = [str(cell).replace('\n', ' ') if cell else "" for cell in row]
+                        table_markdown += "| " + " | ".join(cells) + " |\n"
+                    table_markdown += "\n" # Espaço entre tabelas
+            
+            # 3. Monta o conteúdo final da página
+            content = f"--- PÁGINA {i+1} ---\n{text}\n\n### TABELAS E DADOS ESTRUTURADOS:\n{table_markdown}"
+            
+            # Criamos o objeto Document do LangChain
+            doc = Document(
+                page_content=content,
+                metadata={"page": i+1, "source": pdf_path}
+            )
+            documents.append(doc)
+            
+    return documents
 
 # ============================================================
 # MODELOS
@@ -26,7 +60,7 @@ PDF_PATH = "documento.pdf"
 llm = OllamaLLM(
     model="llama3",
     base_url=OLLAMA_BASE_URL,
-    temperature=0.0 # Reduzimos a temperatura para ele ficar mais analítico e menos criativo
+    temperature=0.0
 )
 
 embeddings = OllamaEmbeddings(
@@ -35,55 +69,51 @@ embeddings = OllamaEmbeddings(
 )
 
 # ============================================================
-# VECTOR STORE E INGESTÃO (AGORA SEM ESCONDER ERROS)
+# VECTOR STORE E INGESTÃO
 # ============================================================
-print("🔗 Conectando ao banco de dados...")
 vectorstore = PGVector(
     connection_string=DATABASE_URL,
     collection_name=COLLECTION_NAME,
     embedding_function=embeddings,
 )
 
-# Verifica se a coleção está vazia buscando qualquer coisa
-resultados_existentes = vectorstore.similarity_search("teste_de_existencia", k=1)
+# Verifica se precisa ingerir
+resultados_existentes = vectorstore.similarity_search("teste", k=1)
 
 if len(resultados_existentes) == 0:
-    print("📄 Banco vazio. Iniciando processamento do PDF...")
+    print("🚀 Processando edital com nova estratégia de tabelas...")
     
-    # PDFPlumber é nativo Python e respeita muito melhor a estrutura de tabelas
-    loader = PDFPlumberLoader(PDF_PATH)
+    # Usa a nova função em vez do loader padrão
+    documents = carregar_pdf_com_tabelas(PDF_PATH)
+    print(f"✅ {len(documents)} páginas processadas.")
     
-    print("📚 Carregando PDF...")
-    documents = loader.load()
-    print(f"📄 PDF lido com {len(documents)} páginas.")
-    
-    # Reduzi um pouco o chunk size. 4000 pode diluir muito a informação de uma tabela pequena.
+    # Splitter ajustado para não quebrar linhas de tabelas Markdown
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000, 
+        chunk_size=3000, 
         chunk_overlap=400,
+        separators=["\n--- PÁGINA", "\n### TABELAS", "\n\n", "\n", " "]
     )
     
-    print("🔪 Criando chunks...")
     chunks = splitter.split_documents(documents)
-    print(f"✅ {len(chunks)} chunks criados. Inserindo no banco (isso pode levar alguns segundos)...")
-    
-    # Se falhar aqui, o código vai "quebrar" e mostrar o erro real no terminal
+    print(f"✅ {len(chunks)} chunks criados. Inserindo no PGVector...")
     vectorstore.add_documents(chunks)
-    print(f"✅ Inserção concluída com sucesso!")
 else:
-    print("📦 A tabela langchain_pg_embedding já possui dados. Pulando ingestão.")
+    print("📦 Banco de dados já populado.")
 
 # ============================================================
-# RAG CHAIN E CHAT
+# RAG CHAIN
 # ============================================================
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
+# Prompt refinado para ser mais rigoroso com os nomes dos Campi e cursos
 prompt = ChatPromptTemplate.from_template("""
-Você é um analista de dados preciso e direto. Responda a pergunta do usuário baseando-se EXCLUSIVAMENTE no contexto fornecido.
+Você é um assistente especializado no Edital do IFSULDEMINAS. 
+Responda de forma objetiva usando APENAS o contexto abaixo.
 
-Regras de ouro:
-1. Se a resposta exigir analisar uma tabela, verifique a qual coluna os números pertencem.
-2. Se a resposta não estiver no contexto abaixo, diga "Não encontrei essa informação no documento". Não invente dados.
+REGRAS CRÍTICAS:
+1. Ao citar vagas, confirme se o CAMPUS e o CURSO correspondem exatamente à pergunta.
+2. As tabelas estão em formato Markdown. Leia as colunas com atenção para não trocar os valores das cotas.
+3. Se a informação não estiver clara ou estiver ausente, diga explicitamente que não encontrou.
 
 Contexto:
 {context}
@@ -95,27 +125,22 @@ Resposta:
 """)
 
 def format_docs(docs):
-    # Dica de dev: Se quiser depurar, descomente a linha abaixo para ver o que ele está achando:
-    # print("\n--- CONTEXTO RECUPERADO ---\n", "\n\n".join(doc.page_content for doc in docs), "\n---------------------------\n")
     return "\n\n".join(doc.page_content for doc in docs)
 
 rag_chain = (
-    {
-        "context": retriever | format_docs, 
-        "question": RunnablePassthrough(),
-    }
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
     | prompt
     | llm
     | StrOutputParser()
 )
 
-print("\n🤖 Chatbot pronto! Digite 'sair' para encerrar.")
+# ============================================================
+# CHAT LOOP
+# ============================================================
+print("\n🤖 Chatbot do Edital Pronto!")
 while True:
-    pergunta = input("\nPergunta: ")
-
-    if pergunta.lower() in ["sair", "exit"]:
-        print("Até logo!")
-        break
+    pergunta = input("\nPergunta (ex: 'Quantas vagas para Agronomia em Inconfidentes?'): ")
+    if pergunta.lower() in ["sair", "exit"]: break
     
-    resposta = rag_chain.invoke(pergunta)
-    print("\nResposta:\n", resposta)
+    print("\nAnalisando...")
+    print(rag_chain.invoke(pergunta))
